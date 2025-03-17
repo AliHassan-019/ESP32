@@ -5,7 +5,9 @@
 BluetoothSerial SerialBT;
 bool isBluetoothConnected = false;
 bool espNowPaired = false;
-uint8_t peerAddress[6] = {0};  // Store paired ESP32 MAC
+uint8_t peerAddress[6] = {0};  
+unsigned long lastScanTime = 0;
+const int scanInterval = 5000; 
 
 typedef struct Message {
     char data[100];
@@ -13,25 +15,27 @@ typedef struct Message {
 
 Message message;
 
-// ESP-NOW Receive Callback
 void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
     memcpy(&message, incomingData, len);
     Serial.print("Received via ESP-NOW: ");
     Serial.println(message.data);
 
-    // Forward received ESP-NOW data to Bluetooth
     if (isBluetoothConnected) {
         SerialBT.println(message.data);
     }
 }
 
-// ESP-NOW Send Callback
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
     Serial.print("ESP-NOW Send Status: ");
     Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Failed");
+
+    if (status != ESP_NOW_SEND_SUCCESS) {
+        Serial.println("Resending message...");
+        esp_now_send(peerAddress, (uint8_t *)&message, sizeof(message));
+    }
 }
 
-// Print ESP32 MAC Address
+
 void printMacAddress() {
     uint8_t mac[6];
     WiFi.macAddress(mac);
@@ -49,25 +53,29 @@ void initESPNow() {
     esp_now_register_send_cb(onDataSent);
 }
 
-// Scan for ESP32 devices
-void scanForESP32() {
-    Serial.println("Scanning for ESP32 devices...");
 
+void scanForESP32() {
+    if (millis() - lastScanTime < scanInterval) return;
+    lastScanTime = millis();
+    
+    if (espNowPaired) return;  
+
+    Serial.println("Scanning for ESP32 devices...");
     int numNetworks = WiFi.scanNetworks();
     for (int i = 0; i < numNetworks; i++) {
         String ssid = WiFi.SSID(i);
-        if (ssid.startsWith("ESP32_")) {  // ESP32 identifier
+        if (ssid.startsWith("ESP32_")) { 
             Serial.print("Found ESP32: ");
             Serial.println(ssid);
             
-            WiFi.BSSID(i, peerAddress);  // Get MAC Address
+            WiFi.BSSID(i, peerAddress);  
             Serial.printf("ESP32 MAC: %02X:%02X:%02X:%02X:%02X:%02X\n",
                           peerAddress[0], peerAddress[1], peerAddress[2], 
                           peerAddress[3], peerAddress[4], peerAddress[5]);
 
             esp_now_peer_info_t peerInfo = {};
             memcpy(peerInfo.peer_addr, peerAddress, 6);
-            peerInfo.channel = 0;
+            peerInfo.channel = 1;  
             peerInfo.encrypt = false;
             
             if (esp_now_add_peer(&peerInfo) == ESP_OK) {
@@ -77,7 +85,7 @@ void scanForESP32() {
             break;
         }
     }
-    WiFi.scanDelete();  // Clear scan results
+    WiFi.scanDelete();  
 }
 
 // Check Bluetooth Connection
@@ -99,25 +107,27 @@ void setup() {
     Serial.begin(115200);
     printMacAddress();
 
-    // Setup Wi-Fi in Station + AP Mode
+    
     WiFi.mode(WIFI_AP_STA);
     WiFi.softAP("ESP32_DISCOVERABLE");
+    WiFi.setSleep(false);  
 
     // Start Bluetooth
     SerialBT.begin("ESP32_Bluetooth");
     Serial.println("Bluetooth started. Waiting for mobile connection...");
 
-    // Initialize ESP-NOW
+    
     initESPNow();
 
-    // Try to pair with another ESP32
+    
     scanForESP32();
 }
 
 void loop() {
     checkBluetoothConnection();
+    scanForESP32(); 
 
-    // Handle Bluetooth Data Reception
+    
     if (isBluetoothConnected) {
         while (SerialBT.available()) {
             String receivedData = SerialBT.readString();
@@ -126,28 +136,28 @@ void loop() {
 
             strncpy(message.data, receivedData.c_str(), sizeof(message.data));
 
-            // Send via ESP-NOW
+            
             if (espNowPaired) {
                 esp_now_send(peerAddress, (uint8_t *)&message, sizeof(message));
             }
 
-            // Echo to Serial Monitor
+           
             Serial.println("Forwarding to Serial: " + receivedData);
         }
     }
 
-    // Handle Serial Monitor Data Reception
+    
     if (Serial.available()) {
         String serialData = Serial.readString();
         Serial.print("Received from Serial: ");
         Serial.println(serialData);
 
-        // Send to Bluetooth
+        
         if (isBluetoothConnected) {
             SerialBT.println(serialData);
         }
 
-        // Send via ESP-NOW
+        
         if (espNowPaired) {
             strncpy(message.data, serialData.c_str(), sizeof(message.data));
             esp_now_send(peerAddress, (uint8_t *)&message, sizeof(message));
