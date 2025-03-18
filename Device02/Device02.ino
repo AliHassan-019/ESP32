@@ -6,9 +6,9 @@ BluetoothSerial SerialBT;
 bool isBluetoothConnected = false;
 bool espNowPaired = false;
 uint8_t peerAddress[6] = {0};  
-unsigned long lastScanTime = 0;
+unsigned long lastSyncTime = 0;
+const int syncInterval = 5000;  // Sync every 5 seconds
 const int scanInterval = 10000;  
-
 
 typedef struct Message {
     char data[100];
@@ -17,12 +17,31 @@ typedef struct Message {
 
 Message message;
 
-// ESP-NOW Data Receive Callback
-void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
-    memcpy(&message, incomingData, len);
-    unsigned long receivedTime = millis();  
+typedef struct SyncMessage {
+    unsigned long masterTime;
+} SyncMessage;
 
-    unsigned long latency = receivedTime - message.timestamp;
+SyncMessage syncMsg;
+
+bool isMaster = false;  
+unsigned long timeOffset = 0;  
+
+void syncClocks(unsigned long masterTimestamp) {
+    unsigned long receivedTime = millis();
+    timeOffset = masterTimestamp + ((receivedTime - masterTimestamp) / 2) - receivedTime;
+}
+
+void onDataRecv(const esp_now_recv_info_t *info, const uint8_t *incomingData, int len) {
+    if (len == sizeof(SyncMessage)) {
+        memcpy(&syncMsg, incomingData, len);
+        syncClocks(syncMsg.masterTime);
+        return;
+    }
+    
+    memcpy(&message, incomingData, len);
+    unsigned long receivedTime = millis() + timeOffset;  
+
+    unsigned long latency = receivedTime - (message.timestamp + timeOffset);
     Serial.print("Received via ESP-NOW: ");
     Serial.println(message.data);
     Serial.print("Latency: ");
@@ -40,7 +59,7 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 
     if (status != ESP_NOW_SEND_SUCCESS) {
         Serial.println("Resending message...");
-        delay(10);  
+        delay(10);
         esp_now_send(peerAddress, (uint8_t *)&message, sizeof(message));
     }
 }
@@ -62,11 +81,11 @@ void initESPNow() {
 }
 
 void scanForESP32() {
-    if (espNowPaired || millis() - lastScanTime < scanInterval) return;
-    lastScanTime = millis();
+    if (espNowPaired || millis() - lastSyncTime < scanInterval) return;
+    lastSyncTime = millis();
 
     Serial.println("Scanning for ESP32 devices...");
-    int numNetworks = WiFi.scanNetworks(false, false);  
+    int numNetworks = WiFi.scanNetworks(false, false);
 
     for (int i = 0; i < numNetworks; i++) {
         if (WiFi.SSID(i).startsWith("ESP32_")) {
@@ -93,6 +112,10 @@ void scanForESP32() {
     WiFi.scanDelete();
 }
 
+void sendSyncMessage() {
+    syncMsg.masterTime = millis();
+    esp_now_send(peerAddress, (uint8_t *)&syncMsg, sizeof(syncMsg));
+}
 
 void checkBluetoothConnection() {
     if (SerialBT.hasClient()) {
@@ -108,18 +131,16 @@ void checkBluetoothConnection() {
     }
 }
 
-
 void BluetoothTask(void *pvParameters) {
     while (1) {
         checkBluetoothConnection();
-
         if (isBluetoothConnected && SerialBT.available()) {
             String receivedData = SerialBT.readStringUntil('\n');  
             Serial.print("Received from Bluetooth: ");
             Serial.println(receivedData);
 
             strncpy(message.data, receivedData.c_str(), sizeof(message.data));
-            message.timestamp = millis();  
+            message.timestamp = millis() + timeOffset;  
 
             if (espNowPaired) {
                 esp_now_send(peerAddress, (uint8_t *)&message, sizeof(message));
@@ -142,7 +163,7 @@ void SerialTask(void *pvParameters) {
 
             if (espNowPaired) {
                 strncpy(message.data, serialData.c_str(), sizeof(message.data));
-                message.timestamp = millis();  
+                message.timestamp = millis() + timeOffset;  
                 esp_now_send(peerAddress, (uint8_t *)&message, sizeof(message));
             }
         }
@@ -154,6 +175,15 @@ void WiFiScanTask(void *pvParameters) {
     while (1) {
         scanForESP32();
         vTaskDelay(5000);  
+    }
+}
+
+void TimeSyncTask(void *pvParameters) {
+    while (1) {
+        if (isMaster && espNowPaired) {
+            sendSyncMessage();
+        }
+        vTaskDelay(syncInterval / portTICK_PERIOD_MS);
     }
 }
 
@@ -173,8 +203,9 @@ void setup() {
     xTaskCreatePinnedToCore(BluetoothTask, "Bluetooth Task", 2048, NULL, 1, NULL, 0);
     xTaskCreatePinnedToCore(SerialTask, "Serial Task", 2048, NULL, 1, NULL, 1);
     xTaskCreatePinnedToCore(WiFiScanTask, "WiFi Scan Task", 2048, NULL, 1, NULL, 0);
+    xTaskCreatePinnedToCore(TimeSyncTask, "Time Sync Task", 2048, NULL, 1, NULL, 1);
 }
 
 void loop() {
-    vTaskDelay(1);  
+    vTaskDelay(1);
 }
