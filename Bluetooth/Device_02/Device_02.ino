@@ -6,6 +6,7 @@ BluetoothSerial BTSerial;
 bool isMaster = false;
 bool masterFound = false;
 uint8_t masterMAC[6];  // Store Master's MAC Address
+uint8_t slaveMAC[6];   // Store Slave's MAC Address
 esp_now_peer_info_t peerInfo;
 
 typedef struct {
@@ -18,7 +19,27 @@ DataPacket dataPacket;
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     Serial.print("Received from ESP32: ");
     Serial.println((char*)data);
-    BTSerial.println((char*)data); // Forward to Bluetooth
+
+    // Store Slave MAC in Master Mode
+    if (isMaster) {
+        memcpy(slaveMAC, info->src_addr, 6);
+        esp_now_add_peer(&peerInfo);
+    }
+
+    // Forward data to Bluetooth
+    BTSerial.println((char*)data);
+
+    // Forward data to Slave if Master
+    if (isMaster) {
+        Serial.println("Forwarding data back to Slave...");
+        esp_now_send(slaveMAC, data, len);
+    }
+}
+
+// ESP-NOW callback for sent messages
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.print("ESP-NOW Send Status: ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Failed");
 }
 
 // Scan for Master ESP32
@@ -48,6 +69,29 @@ void registerMasterPeer() {
     }
 }
 
+// Register Slave Peer
+void registerSlavePeer() {
+    memset(&peerInfo, 0, sizeof(peerInfo));
+    memcpy(peerInfo.peer_addr, slaveMAC, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+    if (esp_now_add_peer(&peerInfo) == ESP_OK) {
+        Serial.println("Slave added as ESP-NOW peer.");
+    } else {
+        Serial.println("Failed to add Slave as ESP-NOW peer.");
+    }
+}
+
+// Initialize ESP-NOW
+void initESPNow() {
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW Initialization Failed!");
+        return;
+    }
+    esp_now_register_recv_cb(OnDataRecv);
+    esp_now_register_send_cb(OnDataSent);
+}
+
 // Assign Master/Slave role
 void assignRole() {
     scanForMaster();
@@ -60,12 +104,7 @@ void assignRole() {
         Serial.println("BECOMING MASTER");
         BTSerial.begin("ESP32_Master");
 
-        // ESP-NOW setup for Master
-        esp_now_init();
-        esp_now_register_send_cb([](const uint8_t *mac_addr, esp_now_send_status_t status) {
-            Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Message Sent" : "Send Failed");
-        });
-
+        initESPNow(); // Initialize ESP-NOW for Master
         Serial.println("ESP-NOW Master Ready");
     } else {
         // Master found → Become Slave
@@ -91,23 +130,26 @@ void assignRole() {
             return;
         }
 
-        // ESP-NOW setup for Slave
-        esp_now_init();
-        esp_now_register_recv_cb(OnDataRecv);
+        initESPNow(); // Initialize ESP-NOW for Slave
         registerMasterPeer();
-
         Serial.println("ESP-NOW Slave Ready");
     }
 }
 
 // Send data over ESP-NOW
 void sendData(const char* msg) {
+    if (!isMaster && !esp_now_is_peer_exist(peerInfo.peer_addr)) {
+        Serial.println("No valid peer. Cannot send data.");
+        return;
+    }
     strcpy(dataPacket.message, msg);
+    
     if (isMaster) {
-        esp_now_send(masterMAC, (uint8_t*)&dataPacket, sizeof(dataPacket));
+        esp_now_send(slaveMAC, (uint8_t*)&dataPacket, sizeof(dataPacket));
     } else {
         esp_now_send(peerInfo.peer_addr, (uint8_t*)&dataPacket, sizeof(dataPacket));
     }
+    
     Serial.print("Sent: ");
     Serial.println(msg);
 }

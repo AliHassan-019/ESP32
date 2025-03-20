@@ -15,14 +15,25 @@ typedef struct {
 DataPacket dataPacket;
 
 // ESP-NOW callback for received messages
-void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) 
-
-{
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     Serial.print("Received from ESP32: ");
     Serial.println((char*)data);
-    BTSerial.println((char*)data); // Forward 
-    
-    to Bluetooth
+
+    // Forward data to Bluetooth
+    BTSerial.println((char*)data);  
+
+    // If Master, send the data back to Slave
+    if (isMaster) {
+        Serial.println("Forwarding data back to Slave...");
+        esp_now_send(info->src_addr, data, len);
+    }
+}
+
+
+// ESP-NOW callback for sent messages
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.print("ESP-NOW Send Status: ");
+    Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Success" : "Failed");
 }
 
 // Scan for Master ESP32
@@ -52,6 +63,16 @@ void registerMasterPeer() {
     }
 }
 
+// Initialize ESP-NOW
+void initESPNow() {
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW Initialization Failed!");
+        return;
+    }
+    esp_now_register_recv_cb(OnDataRecv);
+    esp_now_register_send_cb(OnDataSent);
+}
+
 // Assign Master/Slave role
 void assignRole() {
     scanForMaster();
@@ -64,11 +85,7 @@ void assignRole() {
         Serial.println("BECOMING MASTER");
         BTSerial.begin("ESP32_Master");
 
-        // ESP-NOW setup for Master
-        esp_now_init();
-        esp_now_register_send_cb([](const uint8_t *mac_addr, esp_now_send_status_t status) {
-            Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Message Sent" : "Send Failed");
-        });
+        initESPNow(); // Initialize ESP-NOW for Master
 
         Serial.println("ESP-NOW Master Ready");
     } else {
@@ -95,9 +112,7 @@ void assignRole() {
             return;
         }
 
-        // ESP-NOW setup for Slave
-        esp_now_init();
-        esp_now_register_recv_cb(OnDataRecv);
+        initESPNow(); // Initialize ESP-NOW for Slave
         registerMasterPeer();
 
         Serial.println("ESP-NOW Slave Ready");
