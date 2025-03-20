@@ -15,10 +15,14 @@ typedef struct {
 DataPacket dataPacket;
 
 // ESP-NOW callback for received messages
-void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
+void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) 
+
+{
     Serial.print("Received from ESP32: ");
     Serial.println((char*)data);
-    BTSerial.println((char*)data); // Forward to Bluetooth
+    BTSerial.println((char*)data); // Forward 
+    
+    to Bluetooth
 }
 
 // Scan for Master ESP32
