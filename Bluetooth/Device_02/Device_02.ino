@@ -1,109 +1,212 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <BluetoothSerial.h>
+#include <esp_wifi.h>
 
 BluetoothSerial BTSerial;
 bool isMaster = false;
-uint8_t partnerMAC[6] = {0};
+bool masterFound = false;
+uint8_t masterMAC[6] = {0};
+uint8_t slaveMAC[6] = {0};
 esp_now_peer_info_t peerInfo;
 
-typedef struct __attribute__((packed)) {
-    uint32_t timestamp;  // For latency calculation
-    uint16_t seq_num;    // Sequence number
-    bool is_ack;         // ACK flag
-    char message[32];    // Payload
+#define BUFFER_SIZE 32
+char btBuffer[BUFFER_SIZE];
+int btIndex = 0;
+char serialBuffer[BUFFER_SIZE];
+int serialIndex = 0;
+
+typedef struct {
+    char message[32];
+    unsigned long sendTime;
 } DataPacket;
 
-DataPacket txPacket, rxPacket;
-uint16_t packetCounter = 0;
-uint32_t lastSendTime = 0;
-float latencyEMA = 0;   // Exponential Moving Average of latency
-const float alpha = 0.1; // Smoothing factor
+DataPacket dataPacket;
 
-// Corrected callback signature
+// Callback for receiving ESP-NOW data
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
-    memcpy(&rxPacket, data, sizeof(rxPacket));
-    
-    if (!rxPacket.is_ack) {
-        // Handle received message
-        Serial.printf("[RX] Seq: %d | Message: %s\n", rxPacket.seq_num, rxPacket.message);
-        BTSerial.println(rxPacket.message);
+    DataPacket* pkt = (DataPacket*)data;
+    unsigned long latency = micros() - pkt->sendTime;
 
-        // Send ACK
-        DataPacket ack = {
-            .timestamp = rxPacket.timestamp,
-            .seq_num = rxPacket.seq_num,
-            .is_ack = true,
-            .message = "ACK"
-        };
-        esp_now_send(info->src_addr, (uint8_t *)&ack, sizeof(ack));
-    } else {
-        // Calculate latency using sender's timestamp
-        uint32_t rtt = millis() - rxPacket.timestamp;
-        latencyEMA = (alpha * rtt) + ((1 - alpha) * latencyEMA);
-        
-        Serial.printf("[Latency] RTT: %ums | EMA: %.1fms\n", 
-                     rtt, latencyEMA);
+    Serial.print("Received: ");
+    Serial.print(pkt->message);
+    Serial.print(" | Latency: ");
+    Serial.print(latency);
+    Serial.println("µs");
+
+    BTSerial.println(pkt->message);  // Forward message to Bluetooth
+
+    if (isMaster) {
+        // Register slave MAC if received from a new device
+        if (memcmp(slaveMAC, info->src_addr, 6) != 0) {
+            memcpy(slaveMAC, info->src_addr, 6);
+
+            if (!esp_now_is_peer_exist(slaveMAC)) {
+                esp_now_peer_info_t peer;
+                memset(&peer, 0, sizeof(peer));
+                memcpy(peer.peer_addr, slaveMAC, 6);
+                peer.channel = 1;
+                peer.encrypt = false;
+
+                if (esp_now_add_peer(&peer) == ESP_OK) {
+                    Serial.println("Slave peer added successfully");
+                } else {
+                    Serial.println("Failed to add slave peer");
+                }
+            }
+        }
     }
 }
 
-void OnDataSent(const uint8_t *mac, esp_now_send_status_t status) {
-    if (status != ESP_NOW_SEND_SUCCESS) {
-        Serial.println("[Error] Delivery failed");
-    }
+// Callback for sending ESP-NOW data
+void OnDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+    Serial.printf("Data sent to: %02X:%02X:%02X:%02X:%02X:%02X, Status: %s\n",
+                  mac_addr[0], mac_addr[1], mac_addr[2], mac_addr[3], mac_addr[4], mac_addr[5],
+                  status == ESP_NOW_SEND_SUCCESS ? "Success" : "Failed");
 }
 
-void setupESPNow() {
+// Scan for master ESP32
+void scanForMaster() {
+    const int maxRetries = 3;
+    const int scanChannel = 1;
+    masterFound = false;
+
     WiFi.mode(WIFI_STA);
-    if (esp_now_init() != ESP_OK) ESP.restart();
-    
-    esp_now_register_recv_cb(OnDataRecv);  // Now matches the correct signature
+    esp_wifi_set_channel(scanChannel, WIFI_SECOND_CHAN_NONE);
+
+    for (int retry = 0; retry < maxRetries && !masterFound; retry++) {
+        Serial.printf("Scanning (Attempt %d/%d)\n", retry+1, maxRetries);
+        int8_t n = WiFi.scanNetworks(false, true, false, 100, scanChannel);
+
+        if (n > 0) {
+            for (int i = 0; i < n; i++) {
+                if (WiFi.SSID(i) == "ESP32_TWS_Master") {
+                    WiFi.BSSID(i, masterMAC);
+                    masterFound = true;
+                    Serial.printf("Master found on channel %d\n", scanChannel);
+                    break;
+                }
+            }
+        }
+        WiFi.scanDelete();
+    }
+}
+
+// Register the master as a peer
+void registerMasterPeer() {
+    if (!esp_now_is_peer_exist(masterMAC)) {
+        memset(&peerInfo, 0, sizeof(peerInfo));
+        memcpy(peerInfo.peer_addr, masterMAC, 6);
+        peerInfo.channel = 1;
+        peerInfo.encrypt = false;
+
+        if (esp_now_add_peer(&peerInfo) != ESP_OK) {
+            Serial.println("Failed to add master peer");
+        } else {
+            Serial.println("Master peer added successfully");
+        }
+    }
+}
+
+// Initialize ESP-NOW communication
+void initESPNow() {
+    if (esp_now_init() != ESP_OK) {
+        Serial.println("ESP-NOW init failed");
+        ESP.restart();
+    }
+    esp_now_register_recv_cb(OnDataRecv);
     esp_now_register_send_cb(OnDataSent);
 }
 
-void setupRoles() {
-    // Role detection logic from previous implementations
-    // ... (use your existing role setup code here)
-    
-    // After role detection:
-    memcpy(peerInfo.peer_addr, partnerMAC, 6);
-    peerInfo.channel = 1;
-    esp_now_add_peer(&peerInfo);
-}
+// Send data via ESP-NOW
+void sendData(const char* msg) {
+    strncpy(dataPacket.message, msg, sizeof(dataPacket.message) - 1);
+    dataPacket.message[sizeof(dataPacket.message) - 1] = '\0';
+    dataPacket.sendTime = micros();
 
-void sendMessage() {
-    txPacket.timestamp = millis();
-    txPacket.seq_num = packetCounter++;
-    txPacket.is_ack = false;
-    snprintf(txPacket.message, sizeof(txPacket.message), 
-            "Packet %d", packetCounter);
-    
-    esp_now_send(partnerMAC, (uint8_t *)&txPacket, sizeof(txPacket));
-    lastSendTime = millis();
+    uint8_t* targetMAC = isMaster ? slaveMAC : masterMAC;
+
+    // Debugging: Print target MAC before sending
+    Serial.printf("Sending to: %02X:%02X:%02X:%02X:%02X:%02X\n",
+                  targetMAC[0], targetMAC[1], targetMAC[2], targetMAC[3], targetMAC[4], targetMAC[5]);
+
+    if (memcmp(targetMAC, "\0\0\0\0\0\0", 6) != 0) {
+        esp_err_t result = esp_now_send(targetMAC, (uint8_t*)&dataPacket, sizeof(dataPacket));
+        Serial.printf("Send %s\n", result == ESP_OK ? "OK" : "Fail");
+        delay(10); // Small delay to prevent packet loss
+    } else {
+        Serial.println("No valid peer to send data");
+    }
 }
 
 void setup() {
     Serial.begin(115200);
-    BTSerial.begin("ESP32_Latency");
-    setupRoles();
-    setupESPNow();
+    WiFi.mode(WIFI_AP_STA);
+    esp_wifi_set_ps(WIFI_PS_NONE);
+    esp_wifi_config_espnow_rate(WIFI_IF_STA, WIFI_PHY_RATE_54M);
+    esp_wifi_config_espnow_rate(WIFI_IF_AP, WIFI_PHY_RATE_54M);
+
+    scanForMaster();
+    isMaster = !masterFound;
+
+    if (isMaster) {
+        WiFi.softAP("ESP32_TWS_Master", nullptr, 1);
+        Serial.println("Mode: MASTER");
+        BTSerial.begin("ESP32_Master");
+    } else {
+        WiFi.begin("ESP32_TWS_Master", nullptr, 1);
+        Serial.print("Connecting");
+        for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) {
+            delay(250);
+            Serial.print(".");
+        }
+
+        if (WiFi.status() == WL_CONNECTED) {
+            BTSerial.begin("ESP32_Slave");
+            Serial.println("\nConnected");
+        } else {
+            Serial.println("\nFailed to connect, restarting...");
+            ESP.restart();
+        }
+    }
+
+    initESPNow();
+    if (!isMaster) registerMasterPeer();
+
+    // Debug: Print MAC addresses
+    Serial.printf("Master MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                  masterMAC[0], masterMAC[1], masterMAC[2], masterMAC[3], masterMAC[4], masterMAC[5]);
+    Serial.printf("Slave MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
+                  slaveMAC[0], slaveMAC[1], slaveMAC[2], slaveMAC[3], slaveMAC[4], slaveMAC[5]);
 }
 
 void loop() {
-    static uint32_t lastSend = 0;
-    
-    // Send test packet every 2 seconds
-    if (millis() - lastSend > 2000) {
-        sendMessage();
-        lastSend = millis();
+    // Bluetooth input
+    while (BTSerial.available()) {
+        char c = BTSerial.read();
+        if (c == '\n' || btIndex >= BUFFER_SIZE - 1) {
+            btBuffer[btIndex] = '\0';
+            sendData(btBuffer);
+            btIndex = 0;
+        } else {
+            btBuffer[btIndex++] = c;
+        }
     }
 
-    // Handle Bluetooth input
-    if (BTSerial.available()) {
-        String input = BTSerial.readString();
-        input.trim();
-        if (input.length() > 0) {
-            sendMessage();
+    // Serial input
+    while (Serial.available()) {
+        char c = Serial.read();
+        if (c == '\n' || serialIndex >= BUFFER_SIZE - 1) {
+            serialBuffer[serialIndex] = '\0';
+            sendData(serialBuffer);
+            serialIndex = 0;
+        } else {
+            serialBuffer[serialIndex++] = c;
         }
+    }
+
+    if (!isMaster && WiFi.status() != WL_CONNECTED) {
+        Serial.println("Lost connection, restarting...");
+        ESP.restart();
     }
 }
