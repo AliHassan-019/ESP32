@@ -137,6 +137,11 @@ void sendData(const char* msg) {
     } else {
         Serial.println("No valid peer to send data");
     }
+
+    // Add this block to send data to Bluetooth when master sends
+    if (isMaster) {
+        BTSerial.println(dataPacket.message);
+    }
 }
 
 void setup() {
