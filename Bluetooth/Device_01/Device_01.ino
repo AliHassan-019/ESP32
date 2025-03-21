@@ -19,20 +19,33 @@ int serialIndex = 0;
 typedef struct {
     char message[32];
     unsigned long sendTime;
+    unsigned long syncTime;  // New: Synchronization timestamp
 } DataPacket;
 
 DataPacket dataPacket;
+unsigned long timeOffset = 0;  // Offset correction for accurate latency
 
 // Callback for receiving ESP-NOW data
 void OnDataRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     DataPacket* pkt = (DataPacket*)data;
-    unsigned long latency = micros() - pkt->sendTime;
+    
+    // Synchronize timestamps during startup handshake
+    if (strcmp(pkt->message, "SYNC") == 0) {
+        timeOffset = micros() - pkt->syncTime;
+        Serial.println("Time synchronized!");
+        return;
+    }
+
+    // Accurate latency calculation with synchronization offset
+    unsigned long receivedTime = micros();
+    unsigned long latency = (receivedTime - pkt->sendTime) - timeOffset;
+    float latency_ms = latency / 1000.0; // Convert to milliseconds
 
     Serial.print("Received: ");
     Serial.print(pkt->message);
     Serial.print(" | Latency: ");
-    Serial.print(latency);
-    Serial.println("µs");
+    Serial.print(latency_ms, 3); // Print with 3 decimal places
+    Serial.println(" ms");
 
     BTSerial.println(pkt->message);  // Forward message to Bluetooth
 
@@ -122,26 +135,30 @@ void initESPNow() {
 void sendData(const char* msg) {
     strncpy(dataPacket.message, msg, sizeof(dataPacket.message) - 1);
     dataPacket.message[sizeof(dataPacket.message) - 1] = '\0';
-    dataPacket.sendTime = micros();
+    dataPacket.sendTime = micros() - timeOffset;
 
     uint8_t* targetMAC = isMaster ? slaveMAC : masterMAC;
-
-    // Debugging: Print target MAC before sending
-    Serial.printf("Sending to: %02X:%02X:%02X:%02X:%02X:%02X\n",
-                  targetMAC[0], targetMAC[1], targetMAC[2], targetMAC[3], targetMAC[4], targetMAC[5]);
 
     if (memcmp(targetMAC, "\0\0\0\0\0\0", 6) != 0) {
         esp_err_t result = esp_now_send(targetMAC, (uint8_t*)&dataPacket, sizeof(dataPacket));
         Serial.printf("Send %s\n", result == ESP_OK ? "OK" : "Fail");
-        delay(10); // Small delay to prevent packet loss
+        delay(10);
     } else {
         Serial.println("No valid peer to send data");
     }
 
-    // Add this block to send data to Bluetooth when master sends
     if (isMaster) {
         BTSerial.println(dataPacket.message);
     }
+}
+
+// Synchronization handshake
+void syncTime() {
+    strcpy(dataPacket.message, "SYNC");
+    dataPacket.syncTime = micros();
+
+    uint8_t* targetMAC = isMaster ? slaveMAC : masterMAC;
+    esp_now_send(targetMAC, (uint8_t*)&dataPacket, sizeof(dataPacket));
 }
 
 void setup() {
@@ -176,17 +193,14 @@ void setup() {
     }
 
     initESPNow();
-    if (!isMaster) registerMasterPeer();
-
-    // Debug: Print MAC addresses
-    Serial.printf("Master MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
-                  masterMAC[0], masterMAC[1], masterMAC[2], masterMAC[3], masterMAC[4], masterMAC[5]);
-    Serial.printf("Slave MAC: %02X:%02X:%02X:%02X:%02X:%02X\n", 
-                  slaveMAC[0], slaveMAC[1], slaveMAC[2], slaveMAC[3], slaveMAC[4], slaveMAC[5]);
+    if (!isMaster) {
+        registerMasterPeer();
+        delay(500);
+        syncTime();  // Synchronize time after connecting
+    }
 }
 
 void loop() {
-    // Bluetooth input
     while (BTSerial.available()) {
         char c = BTSerial.read();
         if (c == '\n' || btIndex >= BUFFER_SIZE - 1) {
@@ -198,7 +212,6 @@ void loop() {
         }
     }
 
-    // Serial input
     while (Serial.available()) {
         char c = Serial.read();
         if (c == '\n' || serialIndex >= BUFFER_SIZE - 1) {
